@@ -1,4 +1,10 @@
 #!/usr/bin/env python
+
+# Challenges with constant velocity model:
+# XY high error in estimate (10m), but Z quite close to ground truth
+# Theory is that the XY position is lagging, not getting updated properly, as 
+# general shape of the data is maintained
+
 import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (needed for 3D)
@@ -9,47 +15,39 @@ def wrap(x, n):
     assert x.shape == (n,1)
     return x
 
-class PositionKF:  # now CA model: 9-state [p, v, a]
+class PositionKF:
     def __init__(self, x0=None, P0=None, q=0.05, r=1.0):
         self.I3 = np.eye(3, dtype=float)
-        self.I9 = np.eye(9, dtype=float)
-        self.q_j = float(q)         # interpret q as jerk PSD for CA model
+        self.I6 = np.eye(6, dtype=float)
+        self.q_a = float(q)         # interpret q as q_a (accel PSD) to construct Qd
 
-        # x = [px,py,pz, vx,vy,vz, ax,ay,az]^T
-        self.x = wrap(([0,0,0, 0,0,0, 0,0,0] if x0 is None else x0), 9)
-        self.P = np.eye(9, dtype=float) * (1.0 if P0 is None else float(P0))
+        self.x = wrap([0,0,0, 0,0,0] if x0 is None else x0, 6)
+        self.P = np.eye(6, dtype=float) * (1.0 if P0 is None else float(P0))
         self.R_default = np.eye(3, dtype=float) * float(r)
+        self.F = np.eye(6, dtype=float)     # x_{k+1} = F x_k + w  (identity)
+        self.H = np.hstack([self.I3, np.zeros((3,3))] )     # z_k = H x_k + v     (direct position)
 
-        # F and H will be set in predict; H maps position from 9-state
-        self.F = np.eye(9, dtype=float)
-        self.H = np.hstack([self.I3, np.zeros((3,6))])  # z = [I3 0 0] x
+        
 
     def predict(self, dt: float):
-        dt2 = dt*dt
-        # CA state transition
+
         F = np.block([
-            [self.I3,          dt*self.I3,   0.5*dt2*self.I3],
-            [np.zeros((3,3)),  self.I3,      dt*self.I3     ],
-            [np.zeros((3,3)),  np.zeros((3,3)), self.I3     ]
-        ])
+                    [self.I3, dt * self.I3],
+                    [np.zeros((3,3)), self.I3]
+                     ])
+        
         self.F = F
 
-        # Discrete process noise for white jerk PSD q_j
-        dt3, dt4, dt5 = dt**3, dt**4, dt**5
-        Qpp = (dt5/20.0) * self.I3
-        Qpv = (dt4/8.0)  * self.I3
-        Qpa = (dt3/6.0)  * self.I3
-        Qvv = (dt3/3.0)  * self.I3
-        Qva = (dt2/2.0)  * self.I3
-        Qaa = (dt)       * self.I3
-        Qd  = self.q_j * np.block([
-            [Qpp, Qpv, Qpa],
-            [Qpv, Qvv, Qva],
-            [Qpa, Qva, Qaa]
+        # Build Q_d(q_a, dt)
+        dt2, dt3, dt4 = dt*dt, dt*dt*dt, (dt*dt)*(dt*dt)
+        Qd = self.q_a * np.block([
+            [(dt4/4.0)*self.I3, (dt3/2.0)*self.I3],
+            [(dt3/2.0)*self.I3,  (dt2)    *self.I3]
         ])
 
         self.x = F @ self.x
         self.P = F @ self.P @ F.T + Qd
+        self.F = F
 
     def update_pos(self, z, R=None, gate_chi2=1e9):
         z  = wrap(z, 3)
@@ -59,19 +57,39 @@ class PositionKF:  # now CA model: 9-state [p, v, a]
         y = z - (H @ self.x)
         S = H @ self.P @ H.T + Rm
 
-        PHt = self.P @ H.T
-        # Efficient solve: K = PHt @ S^{-1}
-        K = np.linalg.solve(S.T, PHt.T).T
+        # Optional Mahalanobis gate (off by default with huge threshold)
+        # m2 = float(y.T @ np.linalg.solve(S, y))
+        # if m2 > gate_chi2:
+        #     return
 
-        # Joseph-form covariance update for numerical robustness
+        PHt = self.P @ H.T
+        # Use solve instead of explicit inverse for stability
+        K   = PHt @ np.linalg.solve(S, np.eye(3))
+
         self.x = self.x + K @ y
-        I = self.I9
-        KH = K @ H
-        self.P = (I - KH) @ self.P @ (I - KH).T + K @ Rm @ K.T
+        I = np.eye(6, dtype=float)
+        self.P = (I - K @ H) @ self.P
+
+        # or 
+        # PHt = self.P @ H.T
+        # # Efficient solve: K = PHt @ S^{-1}
+        # K = np.linalg.solve(S.T, PHt.T).T
+
+        # self.x = self.x + K @ y
+        # I = self.I6
+        # KH = K @ H
+        # self.P = (I - KH) @ self.P @ (I - KH).T + K @ Rm @ K.T
+
+
+
 
 
 # ---------------- Synthetic data gen ----------------
 def synthetic_truth(N, dt):
+    """
+    Make a smooth 3D path:
+      - horizontal circle (radius R) with slow climb & gentle vertical oscillation
+    """
     t = np.arange(N)*dt
     R = 50.0
     w = 2*np.pi/40.0
@@ -95,24 +113,17 @@ def main():
     truth = synthetic_truth(N, dt)                   # (3,N)
     meas  = simulate_measurements(truth, (2.0, 2.0, 3.0), seed=42)
 
-    # Init: estimate v0 from first two meas; a0 = 0
-    v0 = (meas[:,1] - meas[:,0]) / dt
-    a0 = np.zeros(3)
-    x0 = np.hstack([meas[:,0], v0, a0]).astype(float)   # [p v a] (9,)
-
-    # Priors: large pos/vel/acc uncertainty (vel/acc larger)
+    x0 = np.hstack([meas[:,0], [0,0,0]]).astype(float)   # [x y z vx vy vz]
     P0 = np.block([
-        [np.eye(3)*1e2,  np.zeros((3,3)), np.zeros((3,3))],
-        [np.zeros((3,3)), np.eye(3)*1e3,  np.zeros((3,3))],
-        [np.zeros((3,3)), np.zeros((3,3)), np.eye(3)*1e4]
+        [np.eye(3)*1e2,              np.zeros((3,3))],
+        [np.zeros((3,3)),            np.eye(3)*1e4],     # very uncertain velocities
     ])
 
-    # CA filter (q = jerk PSD). Start with 0.05–0.2; bump up if it still lags on curves
-    kf = PositionKF(x0=x0, P0=None, q=0.1, r=1.0)
-    kf.x = wrap(x0, 9)
+    kf = PositionKF(x0=x0, P0=None, q=0.05, r=1.0)       # construct first…
+    kf.x = wrap(x0, 6)                                   # set state explicitly
     kf.P = P0
 
-    # Measurement covariance (variances)
+    # Use per-sensor R for GPS (variances, not std)
     R_gps = np.diag([2.0**2, 2.0**2, 3.0**2])
 
     # Storage
@@ -122,10 +133,10 @@ def main():
     # Run filter
     for k in range(N):
         kf.predict(dt)
-        kf.update_pos(meas[:,k], R=R_gps)
-        est[:,k] = kf.x[:3].ravel()               # position only
-        Pdiag[:, k] = np.diag(kf.P[:3, :3])       # position variances
-        # print(np.diag(kf.P))  # optional debug
+        kf.update_pos(meas[:,k], R=R_gps)  # position-only update
+        est[:,k] = kf.x[:3].ravel()         # only extract position into the est
+        print( np.diag(kf.P))
+        Pdiag[:, k] = np.diag(kf.P[:3, :3])
 
     # ---------------- Visualization ----------------
     fig = plt.figure(figsize=(10,8))
@@ -134,7 +145,7 @@ def main():
     ax.scatter(meas[0], meas[1], meas[2], c='tab:red', s=12, alpha=0.4, label='Measurements')
     ax.plot(est[0], est[1], est[2], color='tab:blue', lw=2, label='Kalman estimate')
 
-    ax.set_title('3D Position (CA Model): Truth vs Measurements vs Kalman')
+    ax.set_title('3D Position: Truth vs Noisy Measurements vs Kalman')
     ax.set_xlabel('X (m)')
     ax.set_ylabel('Y (m)')
     ax.set_zlabel('Z (m)')
@@ -142,7 +153,7 @@ def main():
     ax.view_init(elev=25, azim=-60)
     plt.tight_layout()
 
-    # Error plot
+    # Error plot (optional but handy)
     fig2, axs = plt.subplots(3,1, figsize=(10,7), sharex=True)
     t = np.arange(N)*dt
     err = est - truth
@@ -155,9 +166,11 @@ def main():
         axs[i].grid(True, alpha=0.3)
     axs[-1].set_xlabel('time (s)')
     axs[0].legend(loc='upper right')
-    fig2.suptitle('Per-axis error and ±2σ from P (CA)')
+    fig2.suptitle('Per-axis error and ±2σ from P')
     plt.tight_layout()
     plt.show()
 
 if __name__ == "__main__":
     main()
+
+
