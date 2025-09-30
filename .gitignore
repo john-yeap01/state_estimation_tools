@@ -1,0 +1,52 @@
+# Catkin build and devel spaces
+build/
+devel/
+logs/
+install/
+
+# catkin tools (catkin build) artifacts
+.catkin_tools/
+.build_isolated/
+devel_isolated/
+install_isolated/
+
+# Colcon (ROS2, but sometimes mixed)
+log/
+install/
+build/
+.deps/
+.testing/
+
+# CMake / Make
+CMakeLists.txt.user
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE/editor stuff
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ROS bag files (optional, if you log data)
+*.bag
+*.bag.active
+*.bag.tmp
+
+# Misc local
+*.log
+*.csv
+*.out
+*.bak
+
+# OS-specific
+.DS_Store
+Thumbs.db
