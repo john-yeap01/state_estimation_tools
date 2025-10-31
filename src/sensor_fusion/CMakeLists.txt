@@ -17,14 +17,20 @@ find_package(catkin REQUIRED COMPONENTS
 
 # System deps
 find_package(Eigen3 REQUIRED)
-find_package(GeographicLib REQUIRED)
+
+## Find GeographicLib
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(GEOGRAPHICLIB REQUIRED geographiclib)
 
 catkin_package()
 
 include_directories(
   ${catkin_INCLUDE_DIRS}
   ${EIGEN3_INCLUDE_DIRS}
+  ${GEOGRAPHICLIB_INCLUDE_DIRS}
 )
+
+link_directories(${GEOGRAPHICLIB_LIBRARY_DIRS})
 
 add_executable(gps_odom_fuser src/gps_odom_fuser.cpp)
 add_dependencies(gps_odom_fuser ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
@@ -32,7 +38,7 @@ add_dependencies(gps_odom_fuser ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXP
 # Prefer the imported target; fallback for older setups noted below
 target_link_libraries(gps_odom_fuser
   ${catkin_LIBRARIES}
-  GeographicLib::GeographicLib
+  ${GEOGRAPHICLIB_LIBRARIES}
 )
 
 # ---- If your distro doesn't provide the imported target, replace the line above with:
