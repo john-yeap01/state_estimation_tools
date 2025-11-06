@@ -1,14 +1,23 @@
 // Loosely coupled EKF to fuse GNSS with the local position odometry from mavros 
 // before feeding into SUPER planner 
+// TODO :
+// 1. add R noise covariance from the GNSS ros msgs
+// 2. Gating? Explore gating options
+// 3. Replacing S.inverse() with a solve (LDLT/LLT).
+// 4. Publishing fused nav_msgs/Odometry + covariances.
+
 #include <ros/ros.h>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/NavSatFix.h>
 #include <geometry_msgs/TransformStamped.h>
+#include <geometry_msgs/Pose.h>
+#include <geometry_msgs/PoseStamped.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <GeographicLib/LocalCartesian.hpp>
 
 #include <memory>
 #include <Eigen/Dense>
+#include <cmath>
 
 using Eigen::MatrixXd;
 using Eigen::VectorXd;
@@ -33,18 +42,24 @@ public:
   void predictTo(const ros::Time& t) {
     if (!inited_) return;
     const double dt = (t - last_t_).toSec();
-    if (dt > 0.0 && dt < 1.0) predict(dt);
-    last_t_ = t;
+
+    if (dt > 0.0 && dt < 1.0) {
+      predict(dt);
+      last_t_ = t;
+    }
+    
   }
 
   void updatePos(const Eigen::Vector3d& z , const Eigen::Matrix3d& R) {
     if (!inited_) return;
+
     Eigen::Matrix<double, 3, 9> H  = Eigen::Matrix<double, 3, 9>::Zero();
     H.block<3,3>(0,0) = Eigen::Matrix3d::Identity();
     Eigen::Vector3d y = z - H * x_;  // FIX: innovation uses full x_
     Eigen::Matrix3d S = H * P_ * H.transpose() + R;
     Eigen::Matrix<double, 9, 3> K = P_ * H.transpose() * S.inverse();
     x_ = x_ +  K * y;
+
     Mat9 KH = K * H;
     Mat9 I = Mat9::Identity();
     P_ = (I - KH) * P_ * (I - KH).transpose() + K * R * K.transpose();
@@ -52,6 +67,8 @@ public:
 
   bool inited() { return inited_; }                       // OK as non-const for now
   Eigen::Vector3d getPosition() { return x_.segment<3>(0); }
+
+  ros::Time lastTime() {return last_t_;}
 
 private:
   void makeFQd(double dt, Mat9& F, Mat9& Qd) {
@@ -101,11 +118,13 @@ public:
     gps_sub_  = nh_.subscribe("/mavros/global_position/global", 10, &LIGONode::gpsCb,  this);
     odom_sub_ = nh_.subscribe("/mavros/local_position/odom",    10, &LIGONode::odom_cb, this);
     kf_ = std::make_shared<KF>();                                    // FIX: actually construct KF
+
+    odom_pub_ = nh.advertise<geometry_msgs::Pose>("/fused_pose", 10);
   }
 
 private:
   void gpsCb(const sensor_msgs::NavSatFix::ConstPtr& msg) {
-    if (msg->status.status < sensor_msgs::NavSatStatus::STATUS_FIX) return;
+    if (!have_odom_ || msg->status.status < sensor_msgs::NavSatStatus::STATUS_FIX) return;
     if (!enu_origin_set_) {
       enu_.Reset(msg->latitude, msg->longitude, msg->altitude);
       enu_origin_set_ = true;
@@ -113,13 +132,35 @@ private:
                        << " lon=" << msg->longitude
                        << " alt=" << msg->altitude);
     }
+
+    ros::Time t_gps = msg->header.stamp;
+    ros::Time KF_last_time = kf_->lastTime();
+
+    double dt_gps_odom  = (t_gps - t_odom_last_).toSec();
+
+    // stale
+    if (fabs(dt_gps_odom) > stale_threshold_) {
+      ROS_WARN_STREAM_THROTTLE(2.0, "DROP_GPS_STALE Δt=" << dt_gps_odom);
+      return;
+    }
+    // future
+    if (dt_gps_odom > future_slack_) {
+      ROS_WARN_STREAM_THROTTLE(2.0, "DROP_GPS_FUTURE Δt=" << dt_gps_odom);
+      return;
+    }
+
+    if (t_gps < KF_last_time) {
+      ROS_WARN_STREAM_THROTTLE(2.0, "DROP_GPS_BEFORE_KF Δt=" << dt_gps_odom);
+      return;
+    }
+
     double x, y, z;
     enu_.Forward(msg->latitude, msg->longitude, msg->altitude, x, y, z);
     // enu_.Reverse(x,y,z, msg->latitude, msg->longitude, msg->altitude);e
 
     if (!kf_ || !kf_->inited()) return;                              // FIX: guard before predict/update in odom cb
 
-    kf_->predictTo(msg->header.stamp);
+    kf_->predictTo(t_gps);
 
     Eigen::Vector3d z_enu(x, y, z);
 
@@ -129,39 +170,61 @@ private:
     R(1,1) = gps_pos_std_xy_ * gps_pos_std_xy_;
     R(2,2) = gps_pos_std_z_  * gps_pos_std_z_;
 
+    // UPDATE THE ESTIMATE WITH THE GNSS 
     kf_->updatePos(z_enu, R);
 
+    geometry_msgs::Pose pub_msg;
+    const Eigen::Vector3d pos_vector = kf_->getPosition();
+    pub_msg.position.x = pos_vector[0]; 
+    pub_msg.position.y = pos_vector[1]; 
+    pub_msg.position.z = pos_vector[2]; 
+    pub_msg.orientation = last_q_odom_;
+    odom_pub_.publish(pub_msg);
 
-    //publish the position -- later can change to odom or tf type
+    //log the position -- later can change to odom or tf type
     const auto p = kf_->getPosition();
     ROS_INFO_STREAM_THROTTLE(1.0, "KF pos (ENU): [" << p.transpose() << "]");
   }
 
   void odom_cb(const nav_msgs::Odometry::ConstPtr& odom_msg) {
-    const ros::Time t = odom_msg->header.stamp;
+    t_odom_last_ = odom_msg->header.stamp;
+    last_q_odom_ = odom_msg->pose.pose.orientation;
     const Eigen::Vector3d current_pose(odom_msg->pose.pose.position.x,
                                        odom_msg->pose.pose.position.y,
                                        odom_msg->pose.pose.position.z);
     if (kf_ && !kf_->inited()) {
-      kf_->initFromOdom(current_pose, t);
+      kf_->initFromOdom(current_pose, t_odom_last_);
     } else if (kf_) {
-      kf_->predictTo(t);                                             // FIX: advance on odom too
+      kf_->predictTo(t_odom_last_);                                             // FIX: advance on odom too
     }
 
     ROS_INFO_STREAM("Local position: "
                     << current_pose.x() << ", "
                     << current_pose.y() << ", "
                     << current_pose.z());                            // FIX: log numeric, not geometry type
+
+    have_odom_ = true;
   }
+
+
 
   ros::NodeHandle nh_, pnh_;
   ros::Subscriber gps_sub_;
   ros::Subscriber odom_sub_;
+  ros::Publisher odom_pub_;
 
   std::shared_ptr<KF> kf_;
   GeographicLib::LocalCartesian enu_;
   bool enu_origin_set_;
+  bool have_odom_ {false};
   double gps_pos_std_xy_{2.0}, gps_pos_std_z_{3.0};
+
+  ros::Time t_odom_last_;
+  // use the odometry orientation when publishing the fused GNSS LIO
+  geometry_msgs::Quaternion last_q_odom_;
+
+  double stale_threshold_ {0.2};
+  double future_slack_ {0.2};
 };
 
 int main(int argc, char** argv){
