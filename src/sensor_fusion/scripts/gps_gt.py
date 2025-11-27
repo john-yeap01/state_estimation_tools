@@ -60,7 +60,7 @@ class GpsRawToPose:
         self.lon0 = rospy.get_param("~lon0", 149.1652068)
         self.alt0 = rospy.get_param("~alt0", 0.0)
 
-        rospy.Subscriber("/mavros/global_position/raw",
+        rospy.Subscriber("/mavros/global_position/raw/fix",
                          NavSatFix, self.cb, queue_size=1)
 
         self.pub = rospy.Publisher("/gps_pose",

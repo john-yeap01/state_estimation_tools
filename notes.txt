@@ -17,3 +17,7 @@ https://chatgpt.com/share/68e75ee3-6fd4-800b-86ba-f8c215476813
 
 
 https://medium.com/@sasha_przybylski/the-math-behind-extended-kalman-filtering-0df981a87453
+
+
+
+how to make the drone have ground truth and then a simulated drift,

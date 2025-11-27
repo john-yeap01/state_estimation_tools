@@ -43,7 +43,7 @@ public:
     if (!inited_) return;
     const double dt = (t - last_t_).toSec();
 
-    if (dt > 0.0 && dt < 1.0) {
+    if (dt > 0.0 && dt < max_predict_dt_) {
       predict(dt);
       last_t_ = t;
     }
@@ -102,6 +102,8 @@ private:
     P_ = F_ * P_ * F_.transpose() + Qd_;
   }
 
+  double max_predict_dt_ {0.2};
+
   Vec9 x_;
   Mat9 P_;
   double q_ = 0.1;
@@ -115,12 +117,16 @@ class LIGONode {
 public:
   LIGONode (ros::NodeHandle& nh, ros::NodeHandle& pnh)
   : nh_(nh), pnh_(pnh), enu_origin_set_(false) {                      // FIX: init flag here too
-    gps_sub_  = nh_.subscribe("/mavros/global_position/global", 10, &LIGONode::gpsCb,  this);
+    gps_sub_  = nh_.subscribe("/mavros/global_position/raw/fix", 10, &LIGONode::gpsCb,  this);
     odom_sub_ = nh_.subscribe("/mavros/local_position/odom",    10, &LIGONode::odom_cb, this);
     kf_ = std::make_shared<KF>();                                    // FIX: actually construct KF
 
-    odom_pub_ = nh.advertise<geometry_msgs::Pose>("/fused_pose", 10);
+    odom_pub_ = nh.advertise<geometry_msgs::PoseStamped>("/fused_pose", 10);
+
+    pnh_.param<std::string>("frame_id", frame_id_, frame_id_);
   }
+
+  
 
 private:
   void gpsCb(const sensor_msgs::NavSatFix::ConstPtr& msg) {
@@ -133,18 +139,27 @@ private:
                        << " alt=" << msg->altitude);
     }
 
+    if (!kf_ || !kf_->inited()) return;                              // FIX: guard before predict/update in odom cb
+
     ros::Time t_gps = msg->header.stamp;
     ros::Time KF_last_time = kf_->lastTime();
+
+    auto raw_cov = msg->position_covariance;
+    auto raw_cov_type = msg->position_covariance_type;
+
+    Eigen::Map<const Eigen::Matrix<double,3,3,Eigen::RowMajor>>
+        R_map(msg->position_covariance.data());
+    Eigen::Matrix3d R_cov = R_map;
 
     double dt_gps_odom  = (t_gps - t_odom_last_).toSec();
 
     // stale
-    if (fabs(dt_gps_odom) > stale_threshold_) {
+    if (dt_gps_odom < -stale_threshold_) {
       ROS_WARN_STREAM_THROTTLE(2.0, "DROP_GPS_STALE Δt=" << dt_gps_odom);
       return;
     }
     // future
-    if (dt_gps_odom > future_slack_) {
+    if (dt_gps_odom > +future_slack_) {
       ROS_WARN_STREAM_THROTTLE(2.0, "DROP_GPS_FUTURE Δt=" << dt_gps_odom);
       return;
     }
@@ -158,27 +173,39 @@ private:
     enu_.Forward(msg->latitude, msg->longitude, msg->altitude, x, y, z);
     // enu_.Reverse(x,y,z, msg->latitude, msg->longitude, msg->altitude);e
 
-    if (!kf_ || !kf_->inited()) return;                              // FIX: guard before predict/update in odom cb
-
     kf_->predictTo(t_gps);
 
     Eigen::Vector3d z_enu(x, y, z);
 
     // measurement noise covariance R
     Eigen::Matrix3d R = Eigen::Matrix3d::Zero();
-    R(0,0) = gps_pos_std_xy_ * gps_pos_std_xy_;
-    R(1,1) = gps_pos_std_xy_ * gps_pos_std_xy_;
-    R(2,2) = gps_pos_std_z_  * gps_pos_std_z_;
+    switch (msg->position_covariance_type) {
+      case sensor_msgs::NavSatFix::COVARIANCE_TYPE_KNOWN:
+        R = R_cov;                                      // full 3×3
+        break;
+      case sensor_msgs::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN:
+      case sensor_msgs::NavSatFix::COVARIANCE_TYPE_APPROXIMATED:
+        R(0,0) = R_cov(0,0);
+        R(1,1) = R_cov(1,1);
+        R(2,2) = R_cov(2,2);
+        break;
+      default: // UNKNOWN
+        R(0,0) = gps_pos_std_xy_ * gps_pos_std_xy_;
+        R(1,1) = gps_pos_std_xy_ * gps_pos_std_xy_;
+        R(2,2) = gps_pos_std_z_  * gps_pos_std_z_;
+        break;
+    }
 
-    // UPDATE THE ESTIMATE WITH THE GNSS 
     kf_->updatePos(z_enu, R);
 
-    geometry_msgs::Pose pub_msg;
+    geometry_msgs::PoseStamped pub_msg;
+    pub_msg.header.stamp = t_gps;
+    pub_msg.header.frame_id = frame_id_;
     const Eigen::Vector3d pos_vector = kf_->getPosition();
-    pub_msg.position.x = pos_vector[0]; 
-    pub_msg.position.y = pos_vector[1]; 
-    pub_msg.position.z = pos_vector[2]; 
-    pub_msg.orientation = last_q_odom_;
+    pub_msg.pose.position.x = pos_vector[0]; 
+    pub_msg.pose.position.y = pos_vector[1]; 
+    pub_msg.pose.position.z = pos_vector[2]; 
+    pub_msg.pose.orientation = last_q_odom_;
     odom_pub_.publish(pub_msg);
 
     //log the position -- later can change to odom or tf type
@@ -186,6 +213,8 @@ private:
     ROS_INFO_STREAM_THROTTLE(1.0, "KF pos (ENU): [" << p.transpose() << "]");
   }
 
+
+  // ODOM CALLBACK
   void odom_cb(const nav_msgs::Odometry::ConstPtr& odom_msg) {
     t_odom_last_ = odom_msg->header.stamp;
     last_q_odom_ = odom_msg->pose.pose.orientation;
@@ -225,6 +254,9 @@ private:
 
   double stale_threshold_ {0.2};
   double future_slack_ {0.2};
+
+
+  std::string frame_id_ {"world"};
 };
 
 int main(int argc, char** argv){
